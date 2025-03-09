@@ -1,0 +1,525 @@
+#!/usr/bin/perl
+
+# hotcopyctl - Corey Zelinski
+# Scalable wrapper for mysqlhotcopy
+
+use strict;
+use warnings;
+use DBI;
+use Getopt::Long;
+use File::stat;
+use File::Copy::Recursive qw(rmove);
+use File::Path;
+use IO::Compress::Gzip qw(gzip $GzipError);
+
+# Command-line options
+my ($Backup_Dir, $DatabaseFullBackup_Dir, $LockFile, $DatabaseBinLog_Dir);
+my ($Daily, $Weekly, $IgnoreLock, $ForceAll, $BackupDB, $HardLink, $GzipOld, $DeleteOldGzip);
+my ($ExcludeTables, $ShowHelp, $Quiet, $Detail, $DatabaseBinLog_MaxDayAge, $LogFile);
+
+my $ForceRemoveLockfile = 1;    # default = yes
+my $BinLogBatchSize     = 512;  # adjusted according to scale
+my $ForceRMBinLogs      = 0;    # usually unsafe
+my $PurgeSQLBinLogs     = 0;    # safe method to remove binlogs
+my $BinLogCleanup       = 0;    # skip binlog cleanup by default
+
+GetOptions(
+    "daily"                     => \$Daily,
+    "weekly"                    => \$Weekly,
+    "database"                  => \$BackupDB,
+    "backupdir=s"               => \$Backup_Dir,
+    "exclude-tables=s"          => \$ExcludeTables,
+    "hardlink"                  => \$HardLink,
+    "gzip-old"                  => \$GzipOld,
+    "delete-old-gzip"           => \$DeleteOldGzip,
+    "quiet"                     => \$Quiet,
+    "detail"                    => \$Detail,
+    "max-binlog-days=i"         => \$DatabaseBinLog_MaxDayAge,
+    "binlog-batch-size=i"       => \$BinLogBatchSize,
+    "purge-binary-logs!"        => sub { $PurgeSQLBinLogs = 1; $BinLogCleanup = 1 }, 
+    "force-rm-binlogs!"         => sub { $ForceRMBinLogs = 1; $SBinLogCleanup = 1 }, 
+    "binlog-cleanup" 	    	=> sub { $BinLogCleanup = 1; $DatabaseBinLog_MaxDayAge = 90 }, 
+    "logfile=s"                 => \$LogFile,
+    "force!"                    => \$ForceRemoveLockfile,    
+    "help"                      => \$ShowHelp,
+);
+
+if ($ShowHelp) {
+    print <<"_END_";
+Usage: hotcopyctl [OPTIONS]...
+Manages MySQL backups using mysqlhotcopy with additional functionality.
+
+Options:
+  --daily                    Perform a daily backup
+  --weekly                   Perform a weekly backup
+  --database                 Backup MySQL database
+  --backupdir <dir>          Specify alternate backup directory
+  --exclude-tables <pat>     Exclude tables matching pattern
+  --hardlink                 Use hard-linking for unchanged tables
+  --gzip-old                 Compress old backups
+  --delete-old-gzip          Delete old compressed backups
+  --quiet                    Silent mode for unattended execution
+  --detail                   Verbose mode for logging or debugging
+  --binlog-cleanup           Allow binary logfile cleanup
+  --max-binlog-days <n>      Delete binary logfiles older than n days
+  --binlog-batch-size <n>    Delete FS binlogs in batches            (Default = 512)
+  --purge-binary-logs        Use SQL statement `PURGE BINARY LOGS`   (Recommended best practice)
+  --force-rm-binlogs         Directly remove binlog files using `rm` (DANGEROUS: replication issues)
+  --logfile <path>           Log to /path/to/logfile.log             (Defaults to STDOUT and STDERR)
+  --no-force                 Do not force removal of stale lockfiles
+  --help                     Show this help message
+
+Advanced:
+  --dry-run                  Simulate the backup policy without any changes
+
+Example Usage:
+  hotcopyctl --database --backupdir=/data/mysql_backup --exclude-tables "LongitudinalSeries_*"
+  hotcopyctl --weekly --gzip-old --dry-run
+
+_END_
+    exit 0;
+}
+
+# Connection strings
+my $mysql_user = 'root';
+my $mysql_passwd = 'application';
+
+# Defaults
+my $mysql_hotcopy_path = '/usr/bin/mysqlhotcopy';
+my $application_mysql_data_dir = '/var/lib/mysql/application/';
+my $application_mysql_dbname = 'application';
+my $application_mysql_backup_dir = '/data/mysql_backup/';
+my $new_application_mysql_backup_dir = '/data/new_mysql_backup/';
+my $mysql_deltas_dir = '/data/mysql_deltas/';
+my $DatabaseFullBackup_Dir = '/data/mysql_full_backup/';
+my $DatabaseBinLog_Dir = '/var/lib/mysql/binlogs/';
+my $last_backup_file = "$new_application_mysql_backup_dir/last_backup_time.txt";
+my $mysqlhotcopy_extra_options = join(" ", @ARGV);
+
+# Connection strings
+my $mysql_user = 'root';
+my $mysql_passwd = 'application';
+
+# Defaults
+my $mysql_hotcopy_path = '/usr/bin/mysqlhotcopy';
+my $application_mysql_data_dir = '/var/lib/mysql/application/';
+my $application_mysql_dbname = 'application';
+my $application_mysql_backup_dir = '/data/mysql_backup/';
+my $new_application_mysql_backup_dir = '/data/new_mysql_backup/';
+my $mysql_deltas_dir = '/data/mysql_deltas/';
+my $DatabaseFullBackup_Dir = '/data/mysql_full_backup/';
+my $DatabaseBinLog_Dir = '/var/lib/mysql/binlogs/';
+my $last_backup_file = "$new_application_mysql_backup_dir/last_backup_time.txt";
+my $mysqlhotcopy_extra_options = join(" ", @ARGV);
+
+sub log_info {
+    my($message) = @_;
+    if ($LogFile) {
+        open(my $fh, '>>', $LogFile) or die "hotcopyctl FATAL: Could not open log file $LogFile: $!";
+        print $fh scalar(localtime).
+        " [INFO] $message\n";
+        close $fh;
+    }
+    print "$message\n"
+    unless $Quiet;
+}
+
+sub log_detail {
+    my($message) = @_;
+    if ($LogFile) {
+        open(my $fh, '>>', $LogFile) or die "hotcopyctl FATAL: Could not open log file $LogFile: $!";
+        print $fh scalar(localtime).
+        " [DETAIL] $message\n";
+        close $fh;
+    }
+    print "$message\n"
+    if $Detail;
+}
+
+log_info("hotcopyctl INFO: Initiating backup policy...") unless $Quiet;
+
+# Ensure required directories exist
+my @required_dirs = (
+    $application_mysql_backup_dir,
+    $mysql_deltas_dir,
+    $DatabaseBinLog_Dir,
+    $DatabaseFullBackup_Dir
+);
+
+foreach my $dir(@required_dirs) {
+    unless(-d $dir) {
+        die "hotcopyctl ERROR: Required directory $dir does not exist\n";
+    }
+}
+
+# Ensure mysqlhotcopy binary exists
+unless(-x $mysql_hotcopy_path) {
+    log_info("hotcopyctl ERROR: Ensure mysql is installed and $mysql_hotcopy_path is executable") unless $Quiet;
+    die "hotcopyctl FATAL: Cannot find or execute $mysql_hotcopy_path\n";
+}
+
+# Ensure the last backup file exists, but allow first - time runs
+unless(-e $last_backup_file) {
+    log_info("hotcopyctl WARN: Timestamp for last backup not found") unless $Quiet;
+    open(my $fh, '>', $last_backup_file) or die "hotcopyctl FATAL: Could not create backup timestamp at $last_backup_file\n";
+    print $fh time, "\n";
+    log_info("hotcopyctl INFO: Created first backup timestamp file at $last_backup_file") unless $Quiet;
+    close($fh);
+}
+
+unless(-d $new_application_mysql_backup_dir) {
+    log_info("hotcopyctl WARN: Backup directory $new_application_mysql_backup_dir not found") unless $Quiet;
+    log_info("hotcopyctl DEBUG: Creating $new_application_mysql_backup_dir") unless $Quiet;
+    mkdir($new_application_mysql_backup_dir, 0755) or die "hotcopyctl FATAL: Could not create backup directory $new_application_mysql_backup_dir";
+}
+
+if ($mysqlhotcopy_extra_options && !$Quiet) {
+    log_info("hotcopyctl WARN: Custom mysqlhotcopy options detected: $mysqlhotcopy_extra_options");
+
+    if ($mysqlhotcopy_extra_options = ~/--allowold|--flushlog/) {
+        log_info("hotcopyctl WARN: Redundant options $mysqlhotcopy_extra_options");
+    }
+}
+
+log_detail("hotcopyctl DEBUG: Backup directory is $new_application_mysql_backup_dir");
+log_detail("hotcopyctl DEBUG: EXCLUDE TABLES - $ExcludeTables") if $ExcludeTables;
+
+# Prevent multiple backups from running simultaneously
+my $LockFile = "/tmp/hotcopyctl.lock";
+if (-e $LockFile) {
+    open(my $lfh, '<', $LockFile) or die "hotcopyctl FATAL: Unable to open lockfile $LockFile";
+    my $old_pid = <$lfh>;
+    close($lfh);
+
+    if (kill 0, $old_pid) {
+        # Check
+        if the process is still running
+        log_info("hotcopyctl ERROR: Duplicate process running under PID $old_pid") unless $Quiet;
+        die "hotcopyctl FATAL: Exiting due to process conflict\n";
+    } else {
+        log_info("hotcopyctl WARN: Detected stale lockfile for PID $old_pid") unless $Quiet;
+        log_info("hotcopyctl DEBUG: Removing lockfile $LockFile") unless $Quiet;
+        unlink $LockFile or die "hotcopyctl FATAL: Stale lockfile $LockFile could not be deleted";
+    }
+}
+
+log_info("hotcopyctl INFO: Creating lockfile") unless $Quiet;
+open(my $lfh, '>', $LockFile) or die "hotcopyctl FATAL: Could not create lockfile $LockFile";
+print $lfh $$;
+close $lfh;
+
+# Determine last backup time
+my $last_backup_time = -e $last_backup_file ? (do {
+    open my $fh, '<', $last_backup_file or die "hotcopyctl FATAL: Cannot open $last_backup_file: $!";
+    my $line = <$fh>;
+    chomp $line;
+    close $fh;
+    $line = ~/^\d+$/ ? $line : time - 14400;
+}) : time - 14400;
+
+my $this_backup_time = time + 100;
+
+# Cleanup old backups
+opendir(DIR, $new_application_mysql_backup_dir) or die "hotcopyctl FATAL: Could not open backup directory $!";
+while (my $fn = readdir(DIR)) {
+    next
+    if ($fn = ~/^\.+$/);
+    # Skip "."
+    and ".."
+    my $file_path = "$new_application_mysql_backup_dir/$fn";
+    my $mtime = (stat($file_path))[9];
+
+    if (time - $mtime > (60 * 60 * 24 * 7)) {
+        # Delete files older than 7 days
+        if (unlink $file_path) {
+            log_detail("hotcopyctl INFO: Deleted old backup file $fn");
+        } else {
+            log_info("hotcopyctl WARN: Failed to delete old backup file $fn") unless $Quiet;
+        }
+    }
+}
+
+closedir(DIR);
+
+# Get all tables
+unless(-d $application_mysql_data_dir) {
+    log_info("hotcopyctl ERROR: Ensure mysql is running and data directory is accessible") unless $Quiet;
+    die "hotcopyctl FATAL: Data directory $application_mysql_data_dir not found";
+}
+opendir(my $dh, $application_mysql_data_dir) || die "hotcopyctl FATAL: Cannot open $application_mysql_data_dir: $!";
+my @all_tables = map {
+    /^(.*).frm$/ ? $1: ()
+}
+readdir($dh);
+close $dh;
+
+# Exclude tables if specified - slower
+my @excluded_tables = $ExcludeTables ? grep {
+    /$ExcludeTables/
+}
+@all_tables: ();
+my @included_tables = grep {
+    !/$ExcludeTables/
+}
+@all_tables;
+
+# Optimized query to get all tables except the excluded ones
+my $excluded_tables_list = join(',', map {
+        "'$_'"
+    }
+    split(',', $ExcludeTables));
+
+my $attempts = 3;
+while ($attempts--) {
+    eval {
+        $dbh = DBI - > connect("DBI:mysql:database=$application_mysql_dbname", $mysql_user, $mysql_passwd, {
+            RaiseError => 1,
+            PrintError => 0,
+            AutoCommit => 1
+        });
+    }
+    last
+    if $dbh;
+    log_info("hotcopyctl WARN: MySQL connection failed - $attempts tries remaining") unless $Quiet;
+    sleep 5;
+}
+die "hotcopyctl FATAL: Database connection failed after $attempts tries - $DBI::errstr"
+unless $dbh;
+
+my $query = "SELECT table_name FROM information_schema.tables 
+WHERE table_schema = ? AND table_name NOT IN($excluded_tables_list)
+";
+
+my $sth = $dbh - > prepare($query);
+$sth - > execute($application_mysql_dbname);
+
+my @included_tables;
+while (my $row = $sth - > fetchrow_array) {
+    push @included_tables, $row;
+}
+
+$sth - > finish;
+
+if ($ExcludeTables) {
+    log_info("hotcopyctl INFO: Excluding tables matching pattern $ExcludeTables") unless $Quiet;
+    if (scalar(@excluded_tables) == 0) {
+        log_info("hotcopyctl WARN: No tables match exclusion pattern") unless $Quiet;
+    } else {
+        log_detail("hotcopyctl DEBUG: Tables excluded: ".join(", ", @excluded_tables));
+    }
+}
+
+# Detect changed tables - relies on UNIX stat
+#my @changed_tables;
+#foreach my $table(@included_tables) {
+# my $frm_stat = stat("${application_mysql_data_dir}/${table}.frm");
+# my $data_stat = stat("${application_mysql_data_dir}/${table}.MYD");
+# my $frm_change_time = $frm_stat ? $frm_stat - > mtime : 0;
+# my $data_change_time = $data_stat ? $data_stat - > mtime : 0;
+#
+# push @changed_tables, $table
+#if $frm_change_time > $last_backup_time || $data_change_time > $last_backup_time;
+
+# Detect changed tables - relies on table Update_time
+my $query = "SELECT table_name FROM information_schema.tables 
+WHERE table_schema = ? AND update_time > FROM_UNIXTIME( ? )
+";
+my @changed_tables = map {
+    $_ - > [0]
+}
+@ {
+    $dbh - > selectall_arrayref($query, undef, $application_mysql_dbname, $last_backup_time)
+};
+
+log_info("hotcopyctl INFO: Disconnecting from database and preparing backup procedure") unless $Quiet;
+
+eval {
+    $dbh - > disconnect;
+    log_info("hotcopyctl INFO: Successfully closed database connection") unless $Quiet;
+};
+if ($ @) {
+    log_info("hotcopyctl ERROR: Database disconnect failed - $@") unless $Quiet;
+}
+
+# Execute mysqlhotcopy with authentication and extra options
+log_detail("hotcopyctl DEBUG: Tables selected for FULL backup: ".join(", ", @included_tables));
+my $tables_string = join('|', @included_tables);
+
+if ($BackupDB) {
+    # Run full backup
+    log_info("hotcopyctl INFO: Running mysqlhotcopy for FULL backup...") unless $Quiet;
+    my $full_backup_cmd = "${mysql_hotcopy_path} --checkpoint --user=$mysql_user --password=$mysql_passwd --flushlog --allowold --keepold --record_log_pos ${application_mysql_dbname}.log_pos ${application_mysql_dbname}./\\b($tables_string)\\b/ ${new_application_mysql_backup_dir} $mysqlhotcopy_extra_options";
+    log_detail("hotcopyctl DEBUG: Executing $full_backup_cmd");
+    my $backup_status = system($full_backup_cmd);
+    my $retry_wait = 5;
+    if ($backup_status != 0) {
+        log_info("hotcopyctl ERROR: mysqlhotcopy FULL backup failed, retrying in $retry_wait seconds...");
+        sleep $retry_wait;
+        $backup_status = system($full_backup_cmd);
+        if ($backup_status != 0) {
+            log_info("hotcopyctl FATAL: mysqlhotcopy failed multiple times - backup incomplete") unless $Quiet;
+            exit 1;
+        }
+    }
+}
+
+# Run delta backup
+if (@changed_tables) {
+    log_info("hotcopyctl INFO: Running INCREMENTAL backup of changed tables...") unless $Quiet;
+    log_detail("Tables changed since last backup: ".join(", ", @changed_tables));
+    my $changed_tables_string = join('|', @changed_tables);
+
+    my $delta_backup_cmd = "${mysql_hotcopy_path} --user=$mysql_user --password=$mysql_passwd --addtodest --flushlog --record_log_pos ${application_mysql_dbname}.log_pos ${application_mysql_dbname}./\\b($changed_tables_string)\\b/ ${mysql_deltas_dir}";
+    log_detail("hotcopyctl DEBUG: Executing $delta_backup_cmd");
+
+    $delta_status = system($delta_backup_cmd);
+
+    # First retry logic
+    if the first attempt fails
+    if ($delta_status != 0) {
+        log_info("hotcopyctl ERROR: mysqlhotcopy INCREMENTAL backup failed with exit code $delta_status") unless $Quiet;
+        my $retry_attempts = 3;
+        my $retry_wait = 5;
+
+        my $delta_status = -1;
+        for (my $i = 1; $i <= $retry_attempts; $i++) {
+            log_info("hotcopyctl INFO: Retrying INCREMENTAL backup - attempt $i/$retry_attempts in $retry_wait seconds...") unless $Quiet;
+            sleep $retry_wait;
+            $delta_status = system($delta_backup_cmd);
+
+            if ($delta_status == 0) {
+                log_info("hotcopyctl INFO: INCREMENTAL backup retry completed successfully") unless $Quiet;
+                last;
+            }
+            $retry_wait *= 2;
+            # Exponential backoff is 5 s, 10 s, 20 s
+            $retry_wait = 30
+            if $retry_wait > 30;
+        }
+        if ($delta_status == 0) {
+            log_info("hotcopyctl INFO: INCREMENTAL backup completed successfully") unless $Quiet;
+        } else {
+            log_info("hotcopyctl ERROR: INCREMENTAL backup failed after retries") unless $Quiet;
+        }
+    }
+
+    # Cleanup MySQL binary logs older than specified days
+
+    if ($BinLogCleanup) {
+        if ($PurgeSQLBinLogs) {
+            log_info("hotcopyctl INFO: Purging binlogs older than $DatabaseBinLog_MaxDayAge days using SQL...") unless $Quiet;
+
+            # Connect to database
+            my $dbh = DBI - > connect("DBI:mysql:database=mysql", $mysql_user, $mysql_passwd, {
+                RaiseError => 1,
+                PrintError => 0,
+                AutoCommit => 1
+            });
+
+            if (!$dbh) {
+                log_info("hotcopyctl FATAL: Unable to connect to database for binlog cleanup - $DBI::errstr") unless $Quiet;
+                exit 1;
+            }
+
+            # Fetch the oldest binlog available
+            my($oldest_binlog) = $dbh - > selectrow_array("SHOW BINARY LOGS");
+            if (!$oldest_binlog) {
+                log_info("hotcopyctl WARN: No binary logs found for purging") unless $Quiet;
+            } else {
+                # Execute PURGE BINARY LOGS command
+                my $purge_cmd = "PURGE BINARY LOGS BEFORE DATE_SUB(NOW(), INTERVAL $DatabaseBinLog_MaxDayAge DAY)";
+                log_detail("hotcopyctl DEBUG: Executing SQL: $purge_cmd");
+
+                eval {
+                    $dbh - > do($purge_cmd);
+                        log_info("hotcopyctl INFO: Successfully purged old binlogs using SQL") unless $Quiet;
+                };
+                if ($ @) {
+                    log_info("hotcopyctl ERROR: Failed to purge binary logs - $@") unless $Quiet;
+                }
+            }
+
+            # Close database connection
+            eval {
+                $dbh - > disconnect;
+                log_info("hotcopyctl INFO: Closed database connection after PURGE BINARY LOGS") unless $Quiet;
+            };
+            if ($ @) {
+                log_info("hotcopyctl WARN: Error disconnecting from MySQL after purge - $@") unless $Quiet;
+            }
+        }
+        if ($ForceRMBinLogs) {
+            log_info("hotcopyctl INFO: Deleting binlogs from filesystem older than $DatabaseBinLog_MaxDayAge days...") unless $Quiet;
+
+            my $delete_cmd = "find $DatabaseBinLog_Dir -type f -name '*.binlog' -mtime +$DatabaseBinLog_MaxDayAge -exec rm -f {} +";
+            my $delete_status = system($delete_cmd);
+
+            if ($delete_status != 0) {
+                log_info("hotcopyctl ERROR: Some binlogs could not be deleted. Retrying...") unless $Quiet;
+                sleep 10;
+
+                # Retry deletion
+                $delete_status = system($delete_cmd);
+                if ($delete_status != 0) {
+                    log_info("hotcopyctl ERROR: Some binlogs could not be deleted after retry") unless $Quiet;
+                    die "hotcopyctl FATAL: Unable to delete old binlogs - manual removal required\n";
+                }
+            }
+            log_info("hotcopyctl INFO: Binlog cleanup completed successfully") unless $Quiet;
+
+            log_info("hotcopyctl INFO: Iterative binlog removal in batches of $BinLogBatchSize files") unless $Quiet;
+            # Function to batch - delete files and capture failures
+            sub batch_delete {
+                my(@files) = @_;
+                my @failed_files;
+
+                while (@files) {
+                    my @batch = splice(@files, 0, $BinLogBatchSize);
+                    my $delete_cmd = "rm -f ".join(" ", @batch);
+                    my $delete_status = system($delete_cmd);
+
+                    # Capture remaining undeleted files
+                    if ($delete_status != 0) {
+                        push @failed_files, grep {
+                            -e $_
+                        }
+                        @batch;
+                    } else {
+                        log_info("hotcopyctl INFO: Batch deletion successful - no retry needed") unless $Quiet;
+                        return ();
+                        # Exit early
+                        if successful
+                    }
+                }
+                return @failed_files;
+            }
+
+            # Batch deletion - first pass
+            my @remaining_files = batch_delete(@old_files);
+
+            if (@remaining_files) {
+                log_info("hotcopyctl WARN: ".scalar(@remaining_files).
+                    " binlogs still exist after batch deletion")
+                unless $Quiet || scalar(@remaining_files) < 10;
+
+                log_info("hotcopyctl INFO: Retrying batch deletion of binary logfiles") unless $Quiet;
+
+                # Second - pass batch deletion in smaller chunks
+                my(@final_remaining_files, $attempts) = (batch_delete(@remaining_files), 2);
+
+                if (@final_remaining_files) {
+                    log_info("hotcopyctl ERROR: Failed to delete ".scalar(@final_remaining_files).
+                        " binlogs after $attempts tries") unless $Quiet;
+                    foreach my $file(@final_remaining_files) {
+                        log_info("hotcopyctl ERROR: Failed to delete binlog $file");
+                    }
+                } else {
+                    log_info("hotcopyctl INFO: All remaining binlogs have been deleted") unless $Quiet;
+                }
+            } else {
+                log_info("hotcopyctl INFO: All binlogs were deleted successfully") unless $Quiet;
+            }
+        }
+    }
+}
+exit 0;
