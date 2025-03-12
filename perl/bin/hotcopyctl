@@ -96,22 +96,6 @@ my $DatabaseBinLog_Dir = '/var/lib/mysql/binlogs/';
 my $last_backup_file = "$new_application_mysql_backup_dir/last_backup_time.txt";
 my $mysqlhotcopy_extra_options = join(" ", @ARGV);
 
-# Connection strings
-my $mysql_user = 'root';
-my $mysql_passwd = 'application';
-
-# Defaults
-my $mysql_hotcopy_path = '/usr/bin/mysqlhotcopy';
-my $application_mysql_data_dir = '/var/lib/mysql/application/';
-my $application_mysql_dbname = 'application';
-my $application_mysql_backup_dir = '/data/mysql_backup/';
-my $new_application_mysql_backup_dir = '/data/new_mysql_backup/';
-my $mysql_deltas_dir = '/data/mysql_deltas/';
-my $DatabaseFullBackup_Dir = '/data/mysql_full_backup/';
-my $DatabaseBinLog_Dir = '/var/lib/mysql/binlogs/';
-my $last_backup_file = "$new_application_mysql_backup_dir/last_backup_time.txt";
-my $mysqlhotcopy_extra_options = join(" ", @ARGV);
-
 sub log_info {
     my($message) = @_;
     if ($LogFile) {
@@ -141,6 +125,7 @@ log_info("hotcopyctl INFO: Initiating backup policy...") unless $Quiet;
 # Ensure required directories exist
 my @required_dirs = (
     $application_mysql_backup_dir,
+	$application_mysql_data_dir,
     $mysql_deltas_dir,
     $DatabaseBinLog_Dir,
     $DatabaseFullBackup_Dir
@@ -241,27 +226,27 @@ while (my $fn = readdir(DIR)) {
 
 closedir(DIR);
 
-# Get all tables
-unless(-d $application_mysql_data_dir) {
-    log_info("hotcopyctl ERROR: Ensure mysql is running and data directory is accessible") unless $Quiet;
-    die "hotcopyctl FATAL: Data directory $application_mysql_data_dir not found";
-}
-opendir(my $dh, $application_mysql_data_dir) || die "hotcopyctl FATAL: Cannot open $application_mysql_data_dir: $!";
-my @all_tables = map {
-    /^(.*).frm$/ ? $1: ()
-}
-readdir($dh);
-close $dh;
+# Check data dir
+#unless(-d $application_mysql_data_dir) {
+#    log_info("hotcopyctl ERROR: Ensure mysql is running and data directory is accessible") unless $Quiet;
+#    die "hotcopyctl FATAL: Data directory $application_mysql_data_dir not found";
+#}
+#opendir(my $dh, $application_mysql_data_dir) || die "hotcopyctl FATAL: Cannot open $application_mysql_data_dir: $!";
+#my @all_tables = map {
+#    /^(.*).frm$/ ? $1: ()
+#}
+#readdir($dh);
+#close $dh;
 
 # Exclude tables if specified - slower
-my @excluded_tables = $ExcludeTables ? grep {
-    /$ExcludeTables/
-}
-@all_tables: ();
-my @included_tables = grep {
-    !/$ExcludeTables/
-}
-@all_tables;
+#my @excluded_tables = $ExcludeTables ? grep {
+#    /$ExcludeTables/
+#}
+#@all_tables: ();
+#my @included_tables = grep {
+#    !/$ExcludeTables/
+#}
+#@all_tables;
 
 # Optimized query to get all tables except the excluded ones
 my $excluded_tables_list = join(',', map {
@@ -272,7 +257,7 @@ my $excluded_tables_list = join(',', map {
 my $attempts = 3;
 while ($attempts--) {
     eval {
-        $dbh = DBI - > connect("DBI:mysql:database=$application_mysql_dbname", $mysql_user, $mysql_passwd, {
+        $dbh = DBI -> connect("DBI:mysql:database=$application_mysql_dbname", $mysql_user, $mysql_passwd, {
             RaiseError => 1,
             PrintError => 0,
             AutoCommit => 1
@@ -290,18 +275,19 @@ my $query = "SELECT table_name FROM information_schema.tables
 WHERE table_schema = ? AND table_name NOT IN($excluded_tables_list)
 ";
 
-my $sth = $dbh - > prepare($query);
-$sth - > execute($application_mysql_dbname);
+my $sth = $dbh -> prepare($query);
+$sth -> execute($application_mysql_dbname);
 
 my @included_tables;
-while (my $row = $sth - > fetchrow_array) {
+while (my $row = $sth -> fetchrow_array) {
     push @included_tables, $row;
 }
 
-$sth - > finish;
+$sth -> finish;
 
 if ($ExcludeTables) {
     log_info("hotcopyctl INFO: Excluding tables matching pattern $ExcludeTables") unless $Quiet;
+	my @excluded_tables = grep { /$ExcludeTables/ } @included_tables;
     if (scalar(@excluded_tables) == 0) {
         log_info("hotcopyctl WARN: No tables match exclusion pattern") unless $Quiet;
     } else {
@@ -314,27 +300,22 @@ if ($ExcludeTables) {
 #foreach my $table(@included_tables) {
 # my $frm_stat = stat("${application_mysql_data_dir}/${table}.frm");
 # my $data_stat = stat("${application_mysql_data_dir}/${table}.MYD");
-# my $frm_change_time = $frm_stat ? $frm_stat - > mtime : 0;
-# my $data_change_time = $data_stat ? $data_stat - > mtime : 0;
+# my $frm_change_time = $frm_stat ? $frm_stat -> mtime : 0;
+# my $data_change_time = $data_stat ? $data_stat -> mtime : 0;
 #
 # push @changed_tables, $table
 #if $frm_change_time > $last_backup_time || $data_change_time > $last_backup_time;
 
 # Detect changed tables - relies on table Update_time
-my $query = "SELECT table_name FROM information_schema.tables 
-WHERE table_schema = ? AND update_time > FROM_UNIXTIME( ? )
-";
-my @changed_tables = map {
-    $_ - > [0]
-}
-@ {
-    $dbh - > selectall_arrayref($query, undef, $application_mysql_dbname, $last_backup_time)
+my $query = "SELECT table_name FROM information_schema.tables WHERE table_schema = ? AND update_time > FROM_UNIXTIME( ? )";
+my @changed_tables = map { $_->[0] } @{ 
+    $dbh->selectall_arrayref($query_changed_tables, undef, $application_mysql_dbname, $last_backup_time)
 };
 
 log_info("hotcopyctl INFO: Disconnecting from database and preparing backup procedure") unless $Quiet;
 
 eval {
-    $dbh - > disconnect;
+    $dbh -> disconnect;
     log_info("hotcopyctl INFO: Successfully closed database connection") unless $Quiet;
 };
 if ($ @) {
@@ -410,7 +391,7 @@ if (@changed_tables) {
             log_info("hotcopyctl INFO: Purging binlogs older than $DatabaseBinLog_MaxDayAge days using SQL...") unless $Quiet;
 
             # Connect to database
-            my $dbh = DBI - > connect("DBI:mysql:database=mysql", $mysql_user, $mysql_passwd, {
+            my $dbh = DBI -> connect("DBI:mysql:database=mysql", $mysql_user, $mysql_passwd, {
                 RaiseError => 1,
                 PrintError => 0,
                 AutoCommit => 1
@@ -422,7 +403,7 @@ if (@changed_tables) {
             }
 
             # Fetch the oldest binlog available
-            my($oldest_binlog) = $dbh - > selectrow_array("SHOW BINARY LOGS");
+            my($oldest_binlog) = $dbh -> selectrow_array("SHOW BINARY LOGS");
             if (!$oldest_binlog) {
                 log_info("hotcopyctl WARN: No binary logs found for purging") unless $Quiet;
             } else {
@@ -431,7 +412,7 @@ if (@changed_tables) {
                 log_detail("hotcopyctl DEBUG: Executing SQL: $purge_cmd");
 
                 eval {
-                    $dbh - > do($purge_cmd);
+                    $dbh -> do($purge_cmd);
                         log_info("hotcopyctl INFO: Successfully purged old binlogs using SQL") unless $Quiet;
                 };
                 if ($ @) {
@@ -441,7 +422,7 @@ if (@changed_tables) {
 
             # Close database connection
             eval {
-                $dbh - > disconnect;
+                $dbh -> disconnect;
                 log_info("hotcopyctl INFO: Closed database connection after PURGE BINARY LOGS") unless $Quiet;
             };
             if ($ @) {
@@ -487,8 +468,7 @@ if (@changed_tables) {
                     } else {
                         log_info("hotcopyctl INFO: Batch deletion successful - no retry needed") unless $Quiet;
                         return ();
-                        # Exit early
-                        if successful
+                        # Exit early if successful
                     }
                 }
                 return @failed_files;
