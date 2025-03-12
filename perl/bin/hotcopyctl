@@ -1,6 +1,6 @@
 #!/usr/bin/perl
 
-# hotcopyctl - Corey Zelinski
+# hotcopyctl - Corey Zelinski <Corey.Zelinski@IEEE.org>
 # Scalable wrapper for mysqlhotcopy
 
 use strict;
