@@ -22,7 +22,7 @@ index a7f19e5..0000000 100644
  my $lock_owned = 0;
 +my $lock_handle;
  my $did_backup = 0;
-@@ -352,27 +354,27 @@
+@@ -352,27 +354,28 @@
  sub acquire_lock {
      return if $DryRun;
  
@@ -72,7 +72,7 @@ index a7f19e5..0000000 100644
 +    $lock_handle = $fh;
      $lock_owned = 1;
  }
-@@ -380,10 +382,7 @@
+@@ -380,10 +383,7 @@
  sub release_lock {
 -    return unless $lock_owned && -e $lock_file;
 -    if (open(my $fh, '<', $lock_file)) {
