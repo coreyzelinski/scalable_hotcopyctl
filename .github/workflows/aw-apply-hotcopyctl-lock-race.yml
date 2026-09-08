@@ -1,0 +1,39 @@
+name: AW apply hotcopyctl lock-race patch
+
+on:
+  push:
+    branches:
+      - aw/AW-CODE-20260907-hotcopyctl-lock-race
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: aw/AW-CODE-20260907-hotcopyctl-lock-race
+          fetch-depth: 0
+      - name: Apply and validate staged patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git apply --check .aw/AW-CODE-20260907-hotcopyctl-lock-race.patch
+          git apply .aw/AW-CODE-20260907-hotcopyctl-lock-race.patch
+          perl -c perl/bin/hotcopyctl
+          git diff --check
+      - name: Commit only the source repair
+        shell: bash
+        run: |
+          set -euo pipefail
+          git rm .aw/AW-CODE-20260907-hotcopyctl-lock-race.patch
+          git rm .github/workflows/aw-apply-hotcopyctl-lock-race.yml
+          git config user.name "Corey Zelinski"
+          git config user.email "Corey.Zelinski@IEEE.org"
+          git add perl/bin/hotcopyctl
+          git diff --cached --check
+          git commit -m "Make hotcopyctl lock acquisition race-free - cvz"
+          git push origin HEAD:aw/AW-CODE-20260907-hotcopyctl-lock-race
