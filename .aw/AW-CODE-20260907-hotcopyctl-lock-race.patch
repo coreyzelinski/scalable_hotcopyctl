@@ -2,27 +2,26 @@ diff --git a/perl/bin/hotcopyctl b/perl/bin/hotcopyctl
 index a7f19e5..0000000 100755
 --- a/perl/bin/hotcopyctl
 +++ b/perl/bin/hotcopyctl
-@@ -6,6 +6,7 @@ use strict;
+@@ -7,5 +7,6 @@ use strict;
  use warnings;
  use Getopt::Long qw(GetOptions);
 +use Fcntl qw(O_CREAT O_RDWR :flock :seek);
  use File::Basename qw(basename);
  use File::Find qw(find);
  use File::Path qw(make_path);
-@@ -50,7 +51,7 @@ Execution/logging:
+@@ -50,5 +51,5 @@ Execution/logging:
    --quiet                    Suppress normal stdout messages
    --detail                   Emit verbose diagnostic messages
 -  --force / --no-force       Allow/disallow stale lockfile removal (default: allow)
 +  --force / --no-force       Legacy compatibility; advisory-lock recovery is automatic
    --dry-run                  Show intended changes without running backup/delete operations
    --help                     Show this help message
-@@ -119,6 +120,7 @@ my $last_backup_file = "$backup_dir/last_backup_time.txt";
+@@ -119,3 +120,4 @@ my $last_backup_file = "$backup_dir/last_backup_time.txt";
  my @mysqlhotcopy_extra_options = @ARGV;
  my $lock_owned = 0;
 +my $lock_handle;
  my $did_backup = 0;
-
-@@ -336,32 +338,34 @@ sub write_last_backup_time {
+@@ -336,36 +338,34 @@ sub write_last_backup_time {
  sub acquire_lock {
      return if $DryRun;
 
